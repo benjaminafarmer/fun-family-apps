@@ -2406,6 +2406,31 @@ const CAL_KEY = 'btc_cal_v1';
 let calFixes = [];        // {label, mapX, mapY, lat, lon, acc}
 let calTransform = null;  // {lat0, lon0, A:[a,b,c,d,e,f], pxPerM}
 let calibrating = false;
+
+// Returns null if geolocation should work, otherwise a human-readable reason + hint.
+function geoUnavailableReason(){
+  if(!window.isSecureContext){
+    return "Location needs the secure (https://) address. Open the map from its GitHub Pages link \\u2014 not a saved file or a plain http:// address.";
+  }
+  if(!('geolocation' in navigator) || !navigator.geolocation){
+    return "This browser view is blocking location. If you opened the map from a link inside another app (Messages, Mail, Instagram\\u2026), tap \\u201cOpen in Safari/Chrome\\u201d and try again.";
+  }
+  // In-app browser sniff \\u2014 these WebViews often silently withhold the GPS prompt
+  const ua = navigator.userAgent || '';
+  if(/(FBAN|FBAV|Instagram|Line|Twitter|WhatsApp|Snapchat|GSA)/i.test(ua)){
+    return "You appear to be in an app\\u2019s built-in browser, which can block location. Tap the \\u2026 menu and choose \\u201cOpen in Safari/Chrome,\\u201d then try again.";
+  }
+  return null;
+}
+
+// Persistent, actionable status shown in the calibration banner (survives longer than a toast).
+function setCalBannerMessage(html){
+  const span = calBanner.querySelector('span');
+  if(span) span.innerHTML = html;
+}
+function resetCalBannerMessage(){
+  setCalBannerMessage('Calibration: stand <b>at a landmark</b>, then tap its pin');
+}
 let watchId = null;
 let memStore = {};        // fallback if localStorage unavailable
 
@@ -2507,10 +2532,9 @@ function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
 function renderCalSheet(){
   const body = document.getElementById('calBody');
   let h = '';
-  if(!navigator.geolocation){
-    h += '<p>This browser does not support location.</p>';
-  } else if(!window.isSecureContext){
-    h += '<p>Location needs the app to be opened from its <b>https://</b> address (e.g. GitHub Pages), not a saved file.</p>';
+  const reason = geoUnavailableReason();
+  if(reason){
+    h += '<div class="cal-status warn">\u26a0\ufe0f ' + reason + '</div>';
   }
   h += '<p>To place the blue dot on this illustrated map, capture a GPS fix while standing at <b>2&ndash;4 landmarks</b> spread across the resort (e.g. main entrance, a village lobby, the waterpark). More spread = better accuracy.</p>';
   if(calFixes.length){
@@ -2551,10 +2575,16 @@ function renderCalSheet(){
   });
   const st = document.getElementById('calStart');
   if(st) st.addEventListener('click', ()=>{
+    const reason = geoUnavailableReason();
     calSheet.classList.remove('show'); sheetBackdrop.classList.remove('show');
     calibrating = true;
+    if(reason){
+      setCalBannerMessage('\u26a0\ufe0f ' + reason);
+    } else {
+      setCalBannerMessage('Zoom to the landmark you\u2019re standing at, then tap its pin');
+    }
     calBanner.classList.add('show');
-    if(scale > 0.9) setScale(MIN_SCALE);
+    // Keep the current zoom \u2014 pins must stay large enough to tap accurately.
   });
   const sh = document.getElementById('calShare');
   if(sh) sh.addEventListener('click', ()=>{
@@ -2581,8 +2611,21 @@ document.getElementById('calDone').addEventListener('click', ()=>{
 // capture flow: called from pin tap while calibrating
 function captureFixAt(loc, inst){
   const pt = loc.points[inst];
-  showToast('Getting GPS fix\u2026 stand still');
-  navigator.geolocation.getCurrentPosition(pos => {
+
+  // Guard first \u2014 a missing geolocation object throws before any prompt, which is
+  // exactly what looks like "nothing happened / it never asked me."
+  const reason = geoUnavailableReason();
+  if(reason){
+    setCalBannerMessage('\u26a0\ufe0f ' + reason);
+    showToast('Location unavailable in this browser');
+    return;
+  }
+
+  let done = false;
+  setCalBannerMessage('Requesting location\u2026 allow the prompt, then stand still');
+
+  function onFix(pos){
+    if(done) return; done = true;
     calFixes.push({
       label: loc.name,
       mapX: pt.x/100*1200, mapY: pt.y/100*938,
@@ -2593,11 +2636,46 @@ function captureFixAt(loc, inst){
     saveCal();
     showToast('Fix saved at '+loc.name+' ('+calFixes.length+' total)');
     if(calFixes.length >= 2 && calTransform){
-      calibrating = false; calBanner.classList.remove('show'); openCalSheet();
+      calibrating = false; calBanner.classList.remove('show'); resetCalBannerMessage(); openCalSheet();
+    } else {
+      setCalBannerMessage('Saved. Now stand at another landmark and tap its pin');
     }
-  }, err => {
-    showToast('Could not get GPS: '+err.message);
-  }, {enableHighAccuracy:true, timeout:15000, maximumAge:0});
+  }
+  function onErr(err){
+    if(done) return; done = true;
+    let msg;
+    if(err && err.code === 1){
+      msg = 'Location permission was blocked. Enable it for this site (browser address bar / iOS Settings \u2192 Safari \u2192 Location), then tap the pin again.';
+    } else if(err && err.code === 3){
+      msg = 'Location timed out. Step outside for a clearer sky view and tap the pin again.';
+    } else {
+      msg = 'Could not read GPS' + (err && err.message ? ' (' + err.message + ')' : '') + '. Tap the pin to retry.';
+    }
+    setCalBannerMessage('\u26a0\ufe0f ' + msg);
+  }
+
+  function request(){
+    try {
+      navigator.geolocation.getCurrentPosition(onFix, onErr,
+        {enableHighAccuracy:true, timeout:15000, maximumAge:0});
+    } catch(e){
+      onErr({code:0, message:e.message});
+    }
+  }
+
+  // If the Permissions API reports a prior "denied", the prompt will NOT reappear \u2014
+  // tell the user how to unblock instead of leaving them tapping a silent pin.
+  if(navigator.permissions && navigator.permissions.query){
+    navigator.permissions.query({name:'geolocation'}).then(st => {
+      if(st.state === 'denied'){
+        onErr({code:1});
+      } else {
+        request();  // 'granted' or 'prompt' \u2014 either way, ask now
+      }
+    }).catch(request);
+  } else {
+    request();
+  }
 }
 
 // ---- live dot ----
@@ -2635,11 +2713,22 @@ function updateUserDot(pos){
 }
 function startWatch(){
   if(watchId !== null) return;
+  const reason = geoUnavailableReason();
+  if(reason){ showToast('Location unavailable'); openCalSheet(); return; }
   firstFixCentered = false;
-  watchId = navigator.geolocation.watchPosition(updateUserDot,
-    err => { showToast('Location error: '+err.message); stopWatch(); },
-    {enableHighAccuracy:true, maximumAge:3000, timeout:20000});
-  locateBtn.classList.add('on');
+  try {
+    watchId = navigator.geolocation.watchPosition(updateUserDot,
+      err => {
+        const m = err && err.code === 1
+          ? 'Location blocked \u2014 enable it for this site and tap \ud83d\udccd again'
+          : 'Location error: ' + (err && err.message ? err.message : 'unknown');
+        showToast(m); stopWatch();
+      },
+      {enableHighAccuracy:true, maximumAge:3000, timeout:20000});
+    locateBtn.classList.add('on');
+  } catch(e){
+    showToast('Location unavailable in this browser'); openCalSheet();
+  }
 }
 function stopWatch(){
   if(watchId !== null){ navigator.geolocation.clearWatch(watchId); watchId = null; }
