@@ -308,6 +308,67 @@
     transition:opacity .25s ease; pointer-events:none;
   }
   .toast.show{opacity:1;}
+  .locate-btn{
+    position:absolute; right:16px; bottom:170px; z-index:60;
+    width:52px; height:52px; border-radius:50%;
+    background:#fff; border:none; font-size:22px;
+    box-shadow:0 3px 10px rgba(0,0,0,0.22); cursor:pointer;
+  }
+  .locate-btn.on{background:var(--sea); color:#fff;}
+  #userSvg{
+    position:absolute; inset:0; width:100%; height:100%;
+    pointer-events:none; z-index:7;
+  }
+  .user-dot-wrap{
+    position:absolute; width:0; height:0; z-index:25;
+    transform:scale(var(--pin-scale,1));
+    display:none;
+  }
+  .user-dot{
+    position:absolute; left:-10px; top:-10px;
+    width:20px; height:20px; border-radius:50%;
+    background:#1a73e8; border:3px solid #fff;
+    box-shadow:0 1px 6px rgba(0,0,0,0.4);
+  }
+  .user-dot::after{
+    content:''; position:absolute; inset:-9px; border-radius:50%;
+    border:2px solid #1a73e8; opacity:0.6;
+    animation:userPulse 2s ease-out infinite;
+  }
+  @keyframes userPulse{
+    0%{transform:scale(0.6); opacity:0.7;}
+    100%{transform:scale(1.6); opacity:0;}
+  }
+  .cal-sheet{
+    position:fixed; left:0; right:0; bottom:0; z-index:110;
+    background:#fff; border-radius:22px 22px 0 0;
+    box-shadow:0 -6px 30px rgba(0,0,0,0.25);
+    padding:14px 20px 26px; transform:translateY(110%);
+    transition:transform .28s ease; max-height:72vh; overflow:auto;
+  }
+  .cal-sheet.show{transform:translateY(0);}
+  .cal-sheet h3{margin:8px 0 4px; font-size:18px;}
+  .cal-sheet p{margin:6px 0; font-size:13.5px; color:#4a5a66; line-height:1.45;}
+  .cal-fix{
+    display:flex; align-items:center; gap:10px;
+    padding:9px 0; border-bottom:1px solid #eef2f5; font-size:13.5px;
+  }
+  .cal-fix .res{margin-left:auto; color:#5b6b78; font-variant-numeric:tabular-nums;}
+  .cal-fix button{
+    border:none; background:#fde8e8; color:#c0392b;
+    border-radius:8px; padding:5px 9px; font-weight:700; cursor:pointer;
+  }
+  .cal-status{
+    font-size:13px; font-weight:700; padding:8px 12px; border-radius:10px;
+    background:#eef3f6; margin:10px 0; display:inline-block;
+  }
+  .cal-status.good{background:#e6f6ea; color:#1a7d36;}
+  .cal-status.warn{background:#fdf3e0; color:#a06a00;}
+  .cal-sheet .sheet-actions{
+    position:sticky; bottom:0; background:#fff;
+    padding:12px 0 4px; margin-top:8px;
+    border-top:1px solid #eef2f5;
+  }
 
   /* ---------- Legend sheet ---------- */
   .legend-sheet .cat-block{margin-bottom:16px;}
@@ -353,12 +414,22 @@
   <button id="routeClear">&#10005;</button>
 </div>
 <div class="toast" id="toast"></div>
+<button class="locate-btn" id="locateBtn" aria-label="Show my location" title="My location">&#128205;</button>
+<div class="route-banner" id="calBanner">
+  <span>Calibration: stand <b>at a landmark</b>, then tap its pin</span>
+  <button id="calDone">Done</button>
+</div>
+<div class="cal-sheet" id="calSheet">
+  <h3>&#128205; Show my location &mdash; setup</h3>
+  <div id="calBody"></div>
+</div>
 <div class="hint" id="hintText">Pinch or double-tap to zoom · tap a pin for details</div>
 
 <div class="map-scroll" id="mapScroll">
   <div class="map-inner" id="mapInner">
     <img id="mapImg" src="" alt="Beaches Turks and Caicos resort map">
     <svg id="routeSvg" viewBox="0 0 1200 938" preserveAspectRatio="none"></svg>
+    <svg id="userSvg" viewBox="0 0 1200 938" preserveAspectRatio="none"></svg>
     <div id="pinLayer"></div>
   </div>
 </div>
@@ -1779,6 +1850,10 @@ LOCATIONS.forEach(loc => {
     pin.appendChild(span);
     pin.addEventListener('click', (e) => {
       e.stopPropagation();
+      if(calibrating){
+        captureFixAt(loc, i);
+        return;
+      }
       if(pickingFor){
         const fromKey = loc.id + '.' + i;
         if(fromKey === pickingFor){ showToast('Pick a different starting pin'); return; }
@@ -2100,6 +2175,8 @@ document.getElementById('nextSpotBtn').addEventListener('click', () => {
 function closeSheets(){
   detailSheet.classList.remove('show');
   legendSheet.classList.remove('show');
+  const cs = document.getElementById('calSheet');
+  if(cs) cs.classList.remove('show');
   sheetBackdrop.classList.remove('show');
   clearHighlights();
 }
@@ -2321,6 +2398,275 @@ function applyHash(){
   }
 }
 window.addEventListener('hashchange', applyHash);
+
+// ================= Geolocation: calibration harness + live dot =================
+// Calibration maps GPS (lat/lon) -> map pixels via an affine transform fitted
+// from fixes captured at known pins. Needs >=2 fixes (similarity), >=3 preferred (affine).
+const CAL_KEY = 'btc_cal_v1';
+let calFixes = [];        // {label, mapX, mapY, lat, lon, acc}
+let calTransform = null;  // {lat0, lon0, A:[a,b,c,d,e,f], pxPerM}
+let calibrating = false;
+let watchId = null;
+let memStore = {};        // fallback if localStorage unavailable
+
+function storeGet(k){ try { return localStorage.getItem(k); } catch(e){ return memStore[k] ?? null; } }
+function storeSet(k,v){ try { localStorage.setItem(k,v); } catch(e){ memStore[k]=v; } }
+function storeDel(k){ try { localStorage.removeItem(k); } catch(e){ delete memStore[k]; } }
+
+function loadCal(){
+  const raw = storeGet(CAL_KEY);
+  if(!raw) return;
+  try {
+    const o = JSON.parse(raw);
+    calFixes = o.fixes || [];
+    calTransform = o.transform || null;
+  } catch(e){}
+}
+function saveCal(){
+  storeSet(CAL_KEY, JSON.stringify({fixes: calFixes, transform: calTransform}));
+}
+
+function toLocalMeters(lat, lon, lat0, lon0){
+  const E = (lon - lon0) * 111320 * Math.cos(lat0 * Math.PI/180);
+  const N = (lat - lat0) * 110540;
+  return [E, N];
+}
+
+function fitTransform(fixes){
+  if(fixes.length < 2) return null;
+  const lat0 = fixes[0].lat, lon0 = fixes[0].lon;
+  const P = fixes.map(f => ({en: toLocalMeters(f.lat, f.lon, lat0, lon0), x: f.mapX, y: f.mapY}));
+  let A;
+  if(fixes.length === 2){
+    // similarity: x = a*E - b*N + c ; y = b*E + a*N + f  (rotation+uniform scale)
+    const [e1,n1] = P[0].en, [e2,n2] = P[1].en;
+    const dE = e2-e1, dN = n2-n1, dx = P[1].x-P[0].x, dy = P[1].y-P[0].y;
+    const den = dE*dE + dN*dN;
+    if(den < 1e-9) return null;
+    const a = (dx*dE + dy*dN)/den, b = (dy*dE - dx*dN)/den;
+    const c = P[0].x - (a*e1 - b*n1);
+    const f = P[0].y - (b*e1 + a*n1);
+    A = [a, -b, c, b, a, f];
+  } else {
+    // least-squares affine: solve M^T M coeffs = M^T v for x and y separately
+    let S=[[0,0,0],[0,0,0],[0,0,0]], vx=[0,0,0], vy=[0,0,0];
+    for(const p of P){
+      const r = [p.en[0], p.en[1], 1];
+      for(let i=0;i<3;i++){
+        for(let j=0;j<3;j++) S[i][j] += r[i]*r[j];
+        vx[i] += r[i]*p.x; vy[i] += r[i]*p.y;
+      }
+    }
+    function solve3(M, v){
+      const m = M.map((row,i)=>[...row, v[i]]);
+      for(let c=0;c<3;c++){
+        let piv = c;
+        for(let r=c+1;r<3;r++) if(Math.abs(m[r][c])>Math.abs(m[piv][c])) piv=r;
+        if(Math.abs(m[piv][c]) < 1e-12) return null;
+        [m[c],m[piv]]=[m[piv],m[c]];
+        for(let r=0;r<3;r++){
+          if(r===c) continue;
+          const k = m[r][c]/m[c][c];
+          for(let cc=c;cc<4;cc++) m[r][cc]-=k*m[c][cc];
+        }
+      }
+      return [m[0][3]/m[0][0], m[1][3]/m[1][1], m[2][3]/m[2][2]];
+    }
+    const cx = solve3(S, vx), cy = solve3(S, vy);
+    if(!cx || !cy) return null;
+    A = [cx[0], cx[1], cx[2], cy[0], cy[1], cy[2]];
+  }
+  // px per meter ~ average of the two row norms
+  const pxPerM = (Math.hypot(A[0],A[1]) + Math.hypot(A[3],A[4]))/2;
+  if(!isFinite(pxPerM) || pxPerM <= 0) return null;
+  return {lat0, lon0, A, pxPerM};
+}
+
+function gpsToMap(lat, lon){
+  if(!calTransform) return null;
+  const [E,N] = toLocalMeters(lat, lon, calTransform.lat0, calTransform.lon0);
+  const A = calTransform.A;
+  return [A[0]*E + A[1]*N + A[2], A[3]*E + A[4]*N + A[5]];
+}
+
+function residuals(){
+  if(!calTransform) return [];
+  return calFixes.map(f => {
+    const m = gpsToMap(f.lat, f.lon);
+    const dpx = Math.hypot(m[0]-f.mapX, m[1]-f.mapY);
+    return dpx / calTransform.pxPerM;   // meters
+  });
+}
+
+// ---- UI: setup sheet ----
+const calSheet = document.getElementById('calSheet');
+const calBanner = document.getElementById('calBanner');
+
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+
+function renderCalSheet(){
+  const body = document.getElementById('calBody');
+  let h = '';
+  if(!navigator.geolocation){
+    h += '<p>This browser does not support location.</p>';
+  } else if(!window.isSecureContext){
+    h += '<p>Location needs the app to be opened from its <b>https://</b> address (e.g. GitHub Pages), not a saved file.</p>';
+  }
+  h += '<p>To place the blue dot on this illustrated map, capture a GPS fix while standing at <b>2&ndash;4 landmarks</b> spread across the resort (e.g. main entrance, a village lobby, the waterpark). More spread = better accuracy.</p>';
+  if(calFixes.length){
+    calFixes.forEach((f,i)=>{
+      h += '<div class="cal-fix"><b>'+esc(f.label)+'</b><span>&plusmn;'+Math.round(f.acc)+'m GPS</span>'
+        + '<span class="res" id="res'+i+'"></span>'
+        + '<button data-del="'+i+'">&#10005;</button></div>';
+    });
+  }
+  if(calTransform){
+    const rs = residuals();
+    const worst = Math.max(...rs);
+    const cls = worst < 25 ? 'good' : 'warn';
+    h += '<div class="cal-status '+cls+'">Calibrated &mdash; worst fit error ~'+Math.round(worst)+' m</div>';
+  } else if(calFixes.length === 1){
+    h += '<div class="cal-status">1 fix captured &mdash; need at least 2</div>';
+  }
+  h += '<div class="sheet-actions">';
+  h += '<button class="action-btn primary" id="calStart">&#10133; Capture a fix</button>';
+  if(calTransform){
+    h += '<button class="action-btn secondary" id="calShare">&#128279; Share calibration</button>';
+    h += '<button class="action-btn secondary" id="calReset">Reset</button>';
+  } else if(calFixes.length){
+    h += '<button class="action-btn secondary" id="calReset">Reset</button>';
+  }
+  h += '</div>';
+  body.innerHTML = h;
+  if(calTransform){
+    const rs = residuals();
+    rs.forEach((r,i)=>{ const el=document.getElementById('res'+i); if(el) el.textContent='fit '+Math.round(r)+'m'; });
+  }
+  body.querySelectorAll('[data-del]').forEach(b=>{
+    b.addEventListener('click', ()=>{
+      calFixes.splice(+b.dataset.del, 1);
+      calTransform = fitTransform(calFixes);
+      saveCal(); renderCalSheet();
+    });
+  });
+  const st = document.getElementById('calStart');
+  if(st) st.addEventListener('click', ()=>{
+    calSheet.classList.remove('show'); sheetBackdrop.classList.remove('show');
+    calibrating = true;
+    calBanner.classList.add('show');
+    if(scale > 0.9) setScale(MIN_SCALE);
+  });
+  const sh = document.getElementById('calShare');
+  if(sh) sh.addEventListener('click', ()=>{
+    const payload = btoa(JSON.stringify({fixes:calFixes, transform:calTransform}));
+    const url = location.origin + location.pathname + '#cal=' + payload;
+    shareUrl(url, 'Location setup \u2014 Beaches T&C map');
+  });
+  const rs = document.getElementById('calReset');
+  if(rs) rs.addEventListener('click', ()=>{
+    calFixes = []; calTransform = null; storeDel(CAL_KEY); stopWatch(); renderCalSheet();
+  });
+}
+
+function openCalSheet(){
+  legendSheet.classList.remove('show'); detailSheet.classList.remove('show');
+  renderCalSheet();
+  sheetBackdrop.classList.add('show');
+  calSheet.classList.add('show');
+}
+document.getElementById('calDone').addEventListener('click', ()=>{
+  calibrating = false; calBanner.classList.remove('show'); openCalSheet();
+});
+
+// capture flow: called from pin tap while calibrating
+function captureFixAt(loc, inst){
+  const pt = loc.points[inst];
+  showToast('Getting GPS fix\u2026 stand still');
+  navigator.geolocation.getCurrentPosition(pos => {
+    calFixes.push({
+      label: loc.name,
+      mapX: pt.x/100*1200, mapY: pt.y/100*938,
+      lat: pos.coords.latitude, lon: pos.coords.longitude,
+      acc: pos.coords.accuracy || 0
+    });
+    calTransform = fitTransform(calFixes);
+    saveCal();
+    showToast('Fix saved at '+loc.name+' ('+calFixes.length+' total)');
+    if(calFixes.length >= 2 && calTransform){
+      calibrating = false; calBanner.classList.remove('show'); openCalSheet();
+    }
+  }, err => {
+    showToast('Could not get GPS: '+err.message);
+  }, {enableHighAccuracy:true, timeout:15000, maximumAge:0});
+}
+
+// ---- live dot ----
+const userSvg = document.getElementById('userSvg');
+const userWrap = document.createElement('div');
+userWrap.className = 'user-dot-wrap';
+userWrap.innerHTML = '<div class="user-dot"></div>';
+pinLayer.appendChild(userWrap);
+const locateBtn = document.getElementById('locateBtn');
+let firstFixCentered = false;
+
+function updateUserDot(pos){
+  const m = gpsToMap(pos.coords.latitude, pos.coords.longitude);
+  if(!m) return;
+  const [x,y] = m;
+  const off = x < -30 || x > 1230 || y < -30 || y > 968;
+  if(off){
+    userWrap.style.display='none'; userSvg.innerHTML='';
+    showToast('You appear to be outside the map area');
+    return;
+  }
+  userWrap.style.display='block';
+  userWrap.style.left = (x/1200*100)+'%';
+  userWrap.style.top = (y/938*100)+'%';
+  const rPx = (pos.coords.accuracy || 10) * calTransform.pxPerM;
+  userSvg.innerHTML = '<circle cx="'+x+'" cy="'+y+'" r="'+rPx.toFixed(1)+'" fill="#1a73e8" opacity="0.14"/>';
+  if(!firstFixCentered){
+    firstFixCentered = true;
+    const rect = mapScroll.getBoundingClientRect();
+    if(scale < 1.2) setScale(1.5);
+    requestAnimationFrame(()=>{
+      mapScroll.scrollTo({left:x*scale-rect.width/2, top:y*scale-rect.height/2, behavior:'smooth'});
+    });
+  }
+}
+function startWatch(){
+  if(watchId !== null) return;
+  firstFixCentered = false;
+  watchId = navigator.geolocation.watchPosition(updateUserDot,
+    err => { showToast('Location error: '+err.message); stopWatch(); },
+    {enableHighAccuracy:true, maximumAge:3000, timeout:20000});
+  locateBtn.classList.add('on');
+}
+function stopWatch(){
+  if(watchId !== null){ navigator.geolocation.clearWatch(watchId); watchId = null; }
+  userWrap.style.display='none'; userSvg.innerHTML='';
+  locateBtn.classList.remove('on');
+}
+locateBtn.addEventListener('click', ()=>{
+  if(watchId !== null){ stopWatch(); return; }
+  if(calTransform) startWatch(); else openCalSheet();
+});
+
+// accept shared calibration via deep link
+(function(){
+  const m = location.hash.match(/^#cal=(.+)$/);
+  if(m){
+    try {
+      const o = JSON.parse(atob(m[1]));
+      if(o.transform && o.fixes){
+        calFixes = o.fixes; calTransform = o.transform; saveCal();
+        showToast('Location setup received \u2014 tap \ud83d\udccd to use it');
+        history.replaceState(null,'',location.pathname+location.search);
+      }
+    } catch(e){}
+  }
+})();
+loadCal();
+
 
 mapImg.addEventListener('load', () => {
   layoutHeight();
