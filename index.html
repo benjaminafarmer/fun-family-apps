@@ -2645,7 +2645,9 @@ function captureFixAt(loc, inst){
     if(done) return; done = true;
     let msg;
     if(err && err.code === 1){
-      msg = 'Location permission was blocked. Enable it for this site (browser address bar / iOS Settings \u2192 Safari \u2192 Location), then tap the pin again.';
+      msg = 'Location was blocked by the browser. On iOS check <b>Settings \u2192 Privacy &amp; Security \u2192 Location Services</b> is ON, and <b>Settings \u2192 Apps \u2192 Safari \u2192 Location</b> is \u201cAllow.\u201d Then tap the pin again.';
+    } else if(err && err.code === 2){
+      msg = 'Position unavailable right now. Step outside for a clearer sky view and tap the pin again.';
     } else if(err && err.code === 3){
       msg = 'Location timed out. Step outside for a clearer sky view and tap the pin again.';
     } else {
@@ -2654,28 +2656,34 @@ function captureFixAt(loc, inst){
     setCalBannerMessage('\u26a0\ufe0f ' + msg);
   }
 
+  // Ask the GPS directly and synchronously within the tap gesture. We deliberately do
+  // NOT pre-check navigator.permissions: on iOS Safari that query can report "denied"
+  // even when Settings grants access, and deferring the call into a .then() breaks
+  // Safari's rule that getCurrentPosition must run inside the user gesture. A genuine
+  // denial still surfaces through the error callback (code 1).
+  let stage = 0;
   function request(){
+    stage++;
+    // Stage 1: quick high-accuracy attempt. Stage 2 (fallback): coarse network fix with
+    // a long timeout \u2014 iOS often can't get a precise fix indoors, and a coarse one is
+    // fine here since the pin already says which landmark you're standing at.
+    const opts = stage === 1
+      ? {enableHighAccuracy:true,  timeout:12000, maximumAge:0}
+      : {enableHighAccuracy:false, timeout:28000, maximumAge:5000};
+    if(stage === 2) setCalBannerMessage('Still trying\u2026 getting a rough fix (up to ~25s)');
     try {
-      navigator.geolocation.getCurrentPosition(onFix, onErr,
-        {enableHighAccuracy:true, timeout:15000, maximumAge:0});
+      navigator.geolocation.getCurrentPosition(onFix, onStageErr, opts);
     } catch(e){
       onErr({code:0, message:e.message});
     }
   }
-
-  // If the Permissions API reports a prior "denied", the prompt will NOT reappear \u2014
-  // tell the user how to unblock instead of leaving them tapping a silent pin.
-  if(navigator.permissions && navigator.permissions.query){
-    navigator.permissions.query({name:'geolocation'}).then(st => {
-      if(st.state === 'denied'){
-        onErr({code:1});
-      } else {
-        request();  // 'granted' or 'prompt' \u2014 either way, ask now
-      }
-    }).catch(request);
-  } else {
-    request();
+  function onStageErr(err){
+    // On a timeout from the precise attempt, fall back once to a coarse fix instead of failing.
+    if(err && err.code === 3 && stage === 1){ request(); return; }
+    onErr(err);
   }
+
+  request();
 }
 
 // ---- live dot ----
